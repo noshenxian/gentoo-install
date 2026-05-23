@@ -66,9 +66,9 @@ MIRROR_HUAWEI="https://mirrors.huaweicloud.com/gentoo"
 # 使用 binary packages 可以大大加快安装速度
 USE_BINARY_PACKAGES="yes"
 
-# 二进制包源 (使用中科大镜像的预编译包)
-BINHOST_USTC="https://mirrors.ustc.edu.cn/gentoo"
-BINHOST_TUNA="https://mirrors.tuna.tsinghua.edu.cn/gentoo"
+# 二进制包源 (使用 amd64 23.0 x86-64 官方 binhost 路径)
+BINHOST_USTC="https://mirrors.ustc.edu.cn/gentoo/releases/amd64/binpackages/23.0/x86-64/"
+BINHOST_TUNA="https://mirrors.tuna.tsinghua.edu.cn/gentoo/releases/amd64/binpackages/23.0/x86-64/"
 
 # ============ 内部状态 ============
 CHROOT_READY=false
@@ -80,6 +80,7 @@ MOUNTED=false
 CONFIG_FILE="/root/.gentoo-install.conf"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_CONFIG="${SCRIPT_DIR}/.gentoo-install.conf"
+LOADED_CONFIG_FILE=""
 
 # 颜色定义
 RED='\033[0;31m'
@@ -115,6 +116,84 @@ get_use_flags() {
         openrc)  echo "$KDE_USE_FLAGS_OPENRC" ;;
         *)       die "未知的初始化系统: $INIT_SYSTEM (支持: systemd / openrc)" ;;
     esac
+}
+
+parse_latest_stage3_file() {
+    local latest_file="$1"
+    awk '/^stage3-.*\.tar\.xz[[:space:]]/ {print $1; exit}' "$latest_file"
+}
+
+parse_sha512_digest() {
+    local digest_file="$1" tarball_name="$2"
+    awk -v tarball="$tarball_name" '
+        $NF == tarball {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[[:xdigit:]]{128}$/) {
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' "$digest_file"
+}
+
+validate_config() {
+    local ok=true
+
+    case "$INIT_SYSTEM" in
+        systemd|openrc) ;;
+        *)
+            log_error "未知的初始化系统: $INIT_SYSTEM (支持: systemd / openrc)"
+            ok=false
+            ;;
+    esac
+
+    case "$ROOT_FS" in
+        ext4|btrfs|xfs) ;;
+        *)
+            log_error "未知文件系统: $ROOT_FS (支持: ext4 / btrfs / xfs)"
+            ok=false
+            ;;
+    esac
+
+    if [[ ! "$EFI_SIZE" =~ ^[0-9]+$ || "$EFI_SIZE" -lt 128 ]]; then
+        log_error "EFI_SIZE 必须是 >= 128 的整数 MB"
+        ok=false
+    fi
+
+    if [[ ! "$SWAP_SIZE" =~ ^[0-9]+$ || "$SWAP_SIZE" -lt 0 ]]; then
+        log_error "SWAP_SIZE 必须是 >= 0 的整数 MB"
+        ok=false
+    fi
+
+    if [[ -z "${DISK:-}" ]]; then
+        log_error "DISK 不能为空"
+        ok=false
+    elif [[ ! -b "$DISK" ]]; then
+        log_error "DISK 不是有效块设备: $DISK"
+        ok=false
+    elif [[ "$(lsblk -ndo TYPE "$DISK" 2>/dev/null || true)" != "disk" ]]; then
+        log_error "DISK 必须指向整块磁盘，而不是分区: $DISK"
+        ok=false
+    fi
+
+    if [[ -z "${HOSTNAME:-}" ]]; then
+        log_error "HOSTNAME 不能为空"
+        ok=false
+    fi
+
+    $ok
+}
+
+write_binrepos_conf() {
+    local root="$1"
+
+    mkdir -p "$root/etc/portage/binrepos.conf"
+    cat > "$root/etc/portage/binrepos.conf/gentoobinhost.conf" << EOF
+[binhost]
+priority = 9999
+sync-uri = ${BINHOST_USTC}
+EOF
 }
 
 # 清理安装环境
@@ -238,6 +317,7 @@ load_config() {
     if [[ -f "$config_file" ]]; then
         log_info "加载配置文件: $config_file"
         source "$config_file"
+        LOADED_CONFIG_FILE="$config_file"
         log_success "配置已加载"
         return 0
     else
@@ -248,13 +328,19 @@ load_config() {
 
 # 显示当前配置
 show_config() {
+    local config_file="${1:-${LOADED_CONFIG_FILE:-}}"
+
     echo ""
     echo "========================================"
     echo "       当前保存的配置"
     echo "========================================"
     echo ""
 
-    if [[ -f "$CONFIG_FILE" ]]; then
+    if [[ -n "$config_file" && -f "$config_file" ]]; then
+        cat "$config_file"
+        echo ""
+        echo "配置文件: $config_file"
+    elif [[ -f "$CONFIG_FILE" ]]; then
         cat "$CONFIG_FILE"
         echo ""
         echo "配置文件: $CONFIG_FILE"
@@ -296,7 +382,7 @@ parse_args() {
                 shift 2
                 ;;
             -s|--show)
-                show_config
+                show_config "$CONFIG_TO_LOAD"
                 exit 0
                 ;;
             -r|--reconfigure)
@@ -323,7 +409,7 @@ parse_args() {
     if [[ -n "$CONFIG_TO_LOAD" ]]; then
         if load_config "$CONFIG_TO_LOAD"; then
             echo ""
-            show_config
+            show_config "$CONFIG_TO_LOAD"
             if ! $DRY_RUN; then
                 echo ""
                 read -p "是否使用此配置开始安装? (y/n) [y]: " confirm
@@ -679,7 +765,7 @@ install_stage3() {
         local list_url="${mirror}/releases/amd64/autobuilds/latest-stage3-amd64-${stage3_variant}.txt"
         log_info "尝试镜像: ${mirror}..."
 
-        stage3_file=$(curl -sf "$list_url" 2>/dev/null | grep -v '^#' | awk '{print $1}' | head -1) || continue
+        stage3_file=$(curl -sf "$list_url" 2>/dev/null | parse_latest_stage3_file /dev/stdin) || continue
 
         if [[ -n "$stage3_file" ]]; then
             stage3_url="${mirror}/releases/amd64/autobuilds/${stage3_file}"
@@ -702,7 +788,7 @@ install_stage3() {
 
         for mirror in "${mirrors[@]}"; do
             local list_url="${mirror}/releases/amd64/autobuilds/latest-stage3-amd64-${fallback_variant}.txt"
-            stage3_file=$(curl -sf "$list_url" 2>/dev/null | grep -v '^#' | awk '{print $1}' | head -1) || continue
+            stage3_file=$(curl -sf "$list_url" 2>/dev/null | parse_latest_stage3_file /dev/stdin) || continue
 
             if [[ -n "$stage3_file" ]]; then
                 stage3_url="${mirror}/releases/amd64/autobuilds/${stage3_file}"
@@ -727,7 +813,7 @@ install_stage3() {
         local tarball_name
         tarball_name=$(basename "$stage3_url")
         local expected_hash actual_hash
-        expected_hash=$(awk "/SHA512.*${tarball_name}/ && !/CONTENTS/ {print \$NF}" stage3.DIGESTS | head -1)
+        expected_hash=$(parse_sha512_digest stage3.DIGESTS "$tarball_name")
         if [[ -n "$expected_hash" ]]; then
             actual_hash=$(sha512sum stage3.tar.xz | awk '{print $1}')
             if [[ "$expected_hash" == "$actual_hash" ]]; then
@@ -768,7 +854,6 @@ configure_make_conf() {
 # 二进制包配置 - 优先使用预编译包
 FEATURES=\"getbinpkg\"
 MAKEBINPKG_RDEPEND=\"yes\"
-PORTAGE_BINHOST=\"${BINHOST_USTC}/binpkg\"
 "
     fi
 
@@ -827,6 +912,10 @@ sync-uri = rsync://rsync.mirrors.ustc.edu.cn/gentoo-portage
 auto-sync = yes
 sync-rsync-extra-opts = --info=progress2
 EOF
+
+    if [[ "$USE_BINARY_PACKAGES" == "yes" ]]; then
+        write_binrepos_conf /mnt/gentoo
+    fi
 
     # 复制 DNS 配置
     cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
@@ -1183,6 +1272,8 @@ main() {
         [[ "$confirm" =~ ^[Nn]$ ]] && exit 0
     fi
 
+    validate_config || die "配置校验失败，请修正后重试"
+
     log_info "开始 Gentoo 安装..."
     echo ""
 
@@ -1205,4 +1296,6 @@ main() {
 }
 
 # 运行
-main "$@"
+if [[ "${LIB_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi
