@@ -10,6 +10,8 @@ Gentoo Linux 自动安装脚本，支持交互式配置和一键安装。
 - 时区选择（支持常用时区）
 - 中科大/清华大学镜像源
 - 预编译二进制包支持（加快安装速度）
+- Stage3 完整性校验
+- 安装前配置校验，避免错误配置直接清盘
 - 配置保存和加载
 - KDE Plasma 桌面环境
 
@@ -67,6 +69,9 @@ chmod +x gentoo-install.sh
 # 使用指定配置文件
 ./gentoo-install.sh -c /path/to/config.conf
 
+# 使用指定配置文件并仅预览，不执行安装
+./gentoo-install.sh -c /path/to/config.conf --dry-run
+
 # 仅查看配置，不执行安装
 ./gentoo-install.sh -d
 ```
@@ -80,12 +85,14 @@ chmod +x gentoo-install.sh
 | 选项 | 说明 | 默认值 |
 |------|------|--------|
 | 磁盘选择 | 选择安装目标磁盘 | /dev/sda |
+| 初始化系统 | systemd 或 OpenRC | systemd |
 | 主机名 | 计算机名称 | gentoo-laptop |
 | 时区 | 系统时区 | Asia/Shanghai |
 | Root 密码 | root 账户密码 | - |
 | 普通用户 | 是否创建普通用户 | yes |
 | 用户名 | 普通用户名 | user |
 | 用户密码 | 普通用户密码 | - |
+| 根文件系统 | ext4 / btrfs / xfs | ext4 |
 | 二进制包 | 是否使用预编译包 | yes |
 
 ### 手动配置
@@ -97,8 +104,10 @@ chmod +x gentoo-install.sh
 DISK="/dev/sda"
 EFI_SIZE=512
 SWAP_SIZE=4096
+ROOT_FS="ext4"
 
 # 系统配置
+INIT_SYSTEM="systemd"
 HOSTNAME="gentoo-laptop"
 TIMEZONE="Asia/Shanghai"
 
@@ -135,6 +144,30 @@ USE_BINARY_PACKAGES="yes"
 
 KDE Plasma 等大型软件包会从预编译仓库下载，而非本地编译。
 
+脚本会写入 Portage 当前推荐的二进制包仓库配置：
+
+```ini
+/etc/portage/binrepos.conf/gentoobinhost.conf
+
+[binhost]
+priority = 9999
+sync-uri = https://mirrors.ustc.edu.cn/gentoo/releases/amd64/binpackages/23.0/x86-64/
+```
+
+同时会在 `make.conf` 中启用 `FEATURES="getbinpkg"`。
+
+## 安全校验
+
+脚本会在执行分区和格式化前校验关键配置：
+
+- `INIT_SYSTEM` 必须是 `systemd` 或 `openrc`
+- `ROOT_FS` 必须是 `ext4`、`btrfs` 或 `xfs`
+- `EFI_SIZE` 和 `SWAP_SIZE` 必须是合法整数
+- `DISK` 必须存在且是整块磁盘，不能是分区
+- `HOSTNAME` 不能为空
+
+Stage3 下载会从 `latest-stage3-*.txt` 中解析实际 tarball，并用 `.DIGESTS` 里的 SHA512 校验下载文件。
+
 ## 安装后
 
 1. 重启系统
@@ -164,6 +197,17 @@ fdisk -l /dev/sda
 ```bash
 # 重新配置
 ./gentoo-install.sh -r
+```
+
+## 开发和测试
+
+```bash
+# 行为测试
+bash tests/test_gentoo_install.sh
+
+# Bash 语法检查
+bash -n gentoo-install.sh
+bash -n tests/test_gentoo_install.sh
 ```
 
 ## License
