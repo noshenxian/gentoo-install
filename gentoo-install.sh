@@ -37,6 +37,9 @@ EFI_SIZE=512
 # SWAP 分区大小 (MB)，建议为内存大小的1-2倍
 SWAP_SIZE=4096
 
+# 根分区文件系统 (ext4/btrfs/xfs)
+ROOT_FS="ext4"
+
 # KDEPlasma USE flags
 KDE_PLASMA_USE_FLAGS="kde plasma udev systemd X wayland ipv6"
 
@@ -116,6 +119,7 @@ save_config() {
 DISK="${DISK}"
 EFI_SIZE=${EFI_SIZE}
 SWAP_SIZE=${SWAP_SIZE}
+ROOT_FS="${ROOT_FS}"
 
 # 系统配置
 HOSTNAME="${HOSTNAME}"
@@ -388,6 +392,54 @@ interactive_users() {
     fi
 }
 
+# 交互式选择文件系统
+select_filesystem() {
+    echo ""
+    echo "========================================"
+    echo "        选择根分区文件系统"
+    echo "========================================"
+    echo ""
+    echo "请选择根分区使用的文件系统:"
+    echo ""
+    echo "  [1] ext4    - 稳定可靠，通用性强 (推荐新手)"
+    echo "  [2] btrfs   - 支持快照、压缩，适合桌面用户"
+    echo "  [3] xfs     - 高性能，适合大文件服务器"
+    echo ""
+    echo "注意: EFI 分区固定使用 FAT32，SWAP 分区使用 swap"
+    echo ""
+
+    while true; do
+        read -p "选择文件系统 [1]: " fs_choice
+        [[ -z "$fs_choice" ]] && fs_choice=1
+
+        case "$fs_choice" in
+            1) ROOT_FS="ext4"; break ;;
+            2) ROOT_FS="btrfs"; break ;;
+            3) ROOT_FS="xfs"; break ;;
+            *) log_warn "无效选择，请重试" ;;
+        esac
+    done
+
+    log_info "已选择文件系统: $ROOT_FS"
+
+    # 显示文件系统说明
+    case "$ROOT_FS" in
+        ext4)
+            echo "  - 经典稳定，广泛使用"
+            echo "  - 最大支持 16TB 单文件"
+            ;;
+        btrfs)
+            echo "  - 支持 COW、快照、压缩"
+            echo "  - 需要更多内存 (建议 >= 4GB)"
+            ;;
+        xfs)
+            echo "  - 高性能，大文件支持好"
+            echo "  - 不支持缩小分区"
+            ;;
+    esac
+    echo ""
+}
+
 # 交互式配置
 interactive_config() {
     echo ""
@@ -398,6 +450,7 @@ interactive_config() {
 
     select_disk
     interactive_users
+    select_filesystem
 
     # 二进制包选项
     echo ""
@@ -419,9 +472,9 @@ interactive_config() {
     echo "========================================"
     echo ""
     echo "将使用以下分区方案:"
-    echo "  EFI 分区:  ${EFI_SIZE}MB (/dev/sda1)"
-    echo "  SWAP 分区: ${SWAP_SIZE}MB (/dev/sda2)"
-    echo "  根分区:    剩余空间 (/dev/sda3)"
+    echo "  EFI 分区:  ${EFI_SIZE}MB (/dev/sda1) - FAT32"
+    echo "  SWAP 分区: ${SWAP_SIZE}MB (/dev/sda2) - swap"
+    echo "  根分区:    剩余空间 (/dev/sda3) - $ROOT_FS"
     echo ""
     read -p "是否继续? (y/n) [n]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
@@ -454,16 +507,33 @@ partition_disk() {
     SWAP_END=$((EFI_SIZE + SWAP_SIZE))
     parted -s $DISK mkpart primary linux-swap ${SWAP_START}MiB ${SWAP_END}MiB
 
-    # 创建根分区 (剩余全部)
+    # 创建根分区 (根据选择的文件系统)
     ROOT_START=$((SWAP_END + 1))
-    parted -s $DISK mkpart primary ext4 ${ROOT_START}MiB 100%
+    parted -s $DISK mkpart primary xfs ${ROOT_START}MiB 100%
 
     # 格式化分区
     log_info "格式化分区..."
+    log_info "文件系统: $ROOT_FS"
 
     mkfs.fat -F 32 ${DISK}1
     mkswap ${DISK}2
-    mkfs.ext4 -F ${DISK}3
+
+    # 根据选择的文件系统格式化根分区
+    case "$ROOT_FS" in
+        ext4)
+            mkfs.ext4 -F ${DISK}3
+            ;;
+        btrfs)
+            mkfs.btrfs -f ${DISK}3
+            ;;
+        xfs)
+            mkfs.xfs -f ${DISK}3
+            ;;
+        *)
+            log_warn "未知文件系统 $ROOT_FS，使用 ext4"
+            mkfs.ext4 -F ${DISK}3
+            ;;
+    esac
 
     # 挂载分区
     log_info "挂载分区..."
@@ -676,15 +746,28 @@ EOF
     log_info "安装 NetworkManager..."
 
     # 配置文件系统表
+    # 根据文件系统设置挂载选项
+    case "$ROOT_FS" in
+        btrfs)
+            ROOT_MOUNTS="defaults,noatime,compress=zstd:3,ssd"
+            ;;
+        xfs)
+            ROOT_MOUNTS="defaults,noatime"
+            ;;
+        *)
+            ROOT_MOUNTS="defaults,noatime"
+            ;;
+    esac
+
     cat > /mnt/gentoo/etc/fstab << EOF
 # /etc/fstab
-# <设备>                                  <挂载点>  <类型>  <选项>                          <dump> <pass>
-UUID=$(blkid -s UUID -o value ${DISK}1)  /boot/efi  vfat    defaults,noatime                0      2
-UUID=$(blkid -s UUID -o value ${DISK}2)  none      swap    sw                              0      0
-UUID=$(blkid -s UUID -o value ${DISK}3)  /         ext4    defaults,noatime                0      1
+# <设备>                                  <挂载点>  <类型>    <选项>                                  <dump> <pass>
+UUID=$(blkid -s UUID -o value ${DISK}1)  /boot/efi  vfat      defaults,noatime                        0      2
+UUID=$(blkid -s UUID -o value ${DISK}2)  none        swap      sw                                      0      0
+UUID=$(blkid -s UUID -o value ${DISK}3)  /           $ROOT_FS  $ROOT_MOUNTS                             0      1
 
 # tmpfs
-tmpfs                                    /tmp      tmpfs   defaults,noatime,mode=1777      0      0
+tmpfs                                    /tmp        tmpfs    defaults,noatime,mode=1777              0      0
 EOF
 
     log_success "网络配置完成"
